@@ -1,34 +1,27 @@
-import { ReactNode, useCallback, lazy, Suspense } from "react";
+import { ReactNode, useCallback, lazy, Suspense, useMemo } from "react";
 import { OrderlyAppProvider } from "@orderly.network/react-app";
-import { useOrderlyConfig } from "@/utils/config";
 import type { NetworkId } from "@orderly.network/types";
+import { DemoGraduationChecker } from "@/components/DemoGraduationChecker";
+import { LoadingSpinner } from "@/components/LoadingSpinner";
+import { useOrderlyConfig } from "@/utils/config";
 import {
-  LocaleProvider,
-  LocaleCode,
-  LocaleEnum,
-  defaultLanguages,
-  Resources,
-} from "@orderly.network/i18n";
-import { withBasePath } from "@/utils/base-path";
-import { getSEOConfig, getUserLanguage } from "@/utils/seo";
+  CustomConfigStore,
+  getDeploymentNetworkId,
+  normalizeDeploymentEnv,
+} from "@/utils/orderly-environment";
 import {
   getRuntimeConfigBoolean,
   getRuntimeConfigArray,
   getRuntimeConfig,
 } from "@/utils/runtime-config";
 import { createSymbolDataAdapter } from "@/utils/symbol-filter";
-import { DemoGraduationChecker } from "@/components/DemoGraduationChecker";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
+import { resolveDexThemeConfig } from "@/utils/theme-config";
 import ServiceDisclaimerDialog from "./ServiceDisclaimerDialog";
-import { ExtendLocaleMessages, extendMessages } from "@/i18n/extend";
-const NETWORK_ID_KEY = "orderly_network_id";
-
-//  preload extend messages to prevent the key name from being displayed when the language file is loaded slowly
-const resources: Resources<ExtendLocaleMessages> = {
-  [LocaleEnum.en]: extendMessages,
-};
+import { OrderlyLocaleProvider } from "./orderlyLocaleProvider";
 
 const getNetworkId = (): NetworkId => {
+  const env = normalizeDeploymentEnv(getRuntimeConfig("VITE_DEPLOYMENT_ENV"));
+  if (env !== "prod") return getDeploymentNetworkId(env);
   if (typeof window === "undefined") return "mainnet";
 
   const disableMainnet = getRuntimeConfigBoolean("VITE_DISABLE_MAINNET");
@@ -42,61 +35,46 @@ const getNetworkId = (): NetworkId => {
     return "mainnet";
   }
 
-  return (localStorage.getItem(NETWORK_ID_KEY) as NetworkId) || "mainnet";
+  return (localStorage.getItem("orderly_network_id") as NetworkId) || "mainnet";
 };
 
 const setNetworkId = (networkId: NetworkId) => {
-  if (typeof window !== "undefined") {
-    localStorage.setItem(NETWORK_ID_KEY, networkId);
+  const env = normalizeDeploymentEnv(getRuntimeConfig("VITE_DEPLOYMENT_ENV"));
+  if (env === "prod" && typeof window !== "undefined") {
+    localStorage.setItem("orderly_network_id", networkId);
   }
-};
-
-const getAvailableLanguages = (): string[] => {
-  const languages = getRuntimeConfigArray("VITE_AVAILABLE_LANGUAGES");
-
-  return languages.length > 0 ? languages : ["en"];
-};
-
-const getDefaultLanguage = (): LocaleCode => {
-  const seoConfig = getSEOConfig();
-  const userLanguage = getUserLanguage();
-  const availableLanguages = getAvailableLanguages();
-
-  if (typeof window !== "undefined") {
-    const urlParams = new URLSearchParams(window.location.search);
-    const langParam = urlParams.get("lang");
-    if (langParam && availableLanguages.includes(langParam)) {
-      return langParam as LocaleCode;
-    }
-  }
-
-  if (seoConfig.language && availableLanguages.includes(seoConfig.language)) {
-    return seoConfig.language as LocaleCode;
-  }
-
-  if (availableLanguages.includes(userLanguage)) {
-    return userLanguage as LocaleCode;
-  }
-
-  return (availableLanguages[0] || "en") as LocaleCode;
 };
 
 const PrivyConnector = lazy(
-  () => import("@/components/orderlyProvider/privyConnector")
+  () => import("@/components/orderlyProvider/privyConnector"),
 );
 const WalletConnector = lazy(
-  () => import("@/components/orderlyProvider/walletConnector")
+  () => import("@/components/orderlyProvider/walletConnector"),
 );
 
 const OrderlyProvider = (props: { children: ReactNode }) => {
   const config = useOrderlyConfig();
+  const deploymentEnv = normalizeDeploymentEnv(
+    getRuntimeConfig("VITE_DEPLOYMENT_ENV"),
+  );
   const networkId = getNetworkId();
+  const configStore = useMemo(
+    () =>
+      new CustomConfigStore({
+        brokerId: getRuntimeConfig("VITE_ORDERLY_BROKER_ID") || "demo",
+        brokerName: getRuntimeConfig("VITE_ORDERLY_BROKER_NAME"),
+        env: deploymentEnv,
+        networkId,
+      }),
+    [deploymentEnv, networkId],
+  );
+  const themes = useMemo(() => resolveDexThemeConfig().themes, []);
 
   const privyAppId = getRuntimeConfig("VITE_PRIVY_APP_ID");
   const usePrivy = !!privyAppId;
 
   const parseChainIds = (
-    envVar: string | undefined
+    envVar: string | undefined,
   ): Array<{ id: number }> | undefined => {
     if (!envVar) return undefined;
     return envVar
@@ -108,12 +86,33 @@ const OrderlyProvider = (props: { children: ReactNode }) => {
   };
 
   const parseDefaultChain = (
-    envVar: string | undefined
-  ): { mainnet: { id: number } } | undefined => {
+    envVar: string | undefined,
+    options?: {
+      mainnet?: Array<{ id: number }>;
+      testnet?: Array<{ id: number }>;
+      networkId: NetworkId;
+    },
+  ): { mainnet?: { id: number }; testnet?: { id: number } } | undefined => {
     if (!envVar) return undefined;
 
     const chainId = parseInt(envVar.trim(), 10);
-    return !isNaN(chainId) ? { mainnet: { id: chainId } } : undefined;
+    if (isNaN(chainId)) return undefined;
+
+    const inMainnet = options?.mainnet?.some((chain) => chain.id === chainId);
+    const inTestnet = options?.testnet?.some((chain) => chain.id === chainId);
+
+    if (inMainnet || inTestnet) {
+      return {
+        ...(inMainnet ? { mainnet: { id: chainId } } : {}),
+        ...(inTestnet ? { testnet: { id: chainId } } : {}),
+      };
+    }
+
+    // No filter match (or filters unset): only set the current networkId key
+    // to avoid applying a mainnet chainId on testnet (and vice versa).
+    return options?.networkId === "testnet"
+      ? { testnet: { id: chainId } }
+      : { mainnet: { id: chainId } };
   };
 
   const disableMainnet = getRuntimeConfigBoolean("VITE_DISABLE_MAINNET");
@@ -134,13 +133,19 @@ const OrderlyProvider = (props: { children: ReactNode }) => {
       : undefined;
 
   const defaultChain = parseDefaultChain(
-    getRuntimeConfig("VITE_DEFAULT_CHAIN")
+    getRuntimeConfig("VITE_DEFAULT_CHAIN"),
+    {
+      mainnet: mainnetChains,
+      testnet: testnetChains,
+      networkId,
+    },
   );
 
   const dataAdapter = createSymbolDataAdapter();
 
   const onChainChanged = useCallback(
     (_chainId: number, { isTestnet }: { isTestnet: boolean }) => {
+      if (deploymentEnv !== "prod") return;
       const currentNetworkId = getNetworkId();
       if (
         (isTestnet && currentNetworkId === "mainnet") ||
@@ -154,46 +159,13 @@ const OrderlyProvider = (props: { children: ReactNode }) => {
         }, 100);
       }
     },
-    []
-  );
-
-  const onLanguageChanged = async (lang: LocaleCode) => {
-    if (typeof window !== "undefined") {
-      const url = new URL(window.location.href);
-      if (lang === LocaleEnum.en) {
-        url.searchParams.delete("lang");
-      } else {
-        url.searchParams.set("lang", lang);
-      }
-      window.history.replaceState({}, "", url.toString());
-    }
-  };
-
-  const loadPath = (lang: LocaleCode) => {
-    const availableLanguages = getAvailableLanguages();
-
-    if (!availableLanguages.includes(lang)) {
-      return [];
-    }
-
-    return [
-      withBasePath(`/locales/${lang}.json`),
-      withBasePath(`/locales/extend/${lang}.json`),
-    ];
-  };
-
-  const defaultLanguage = getDefaultLanguage();
-
-  const availableLanguages = getAvailableLanguages();
-  const filteredLanguages = defaultLanguages.filter((lang) =>
-    availableLanguages.includes(lang.localCode)
+    [deploymentEnv],
   );
 
   const appProvider = (
     <OrderlyAppProvider
-      brokerId={getRuntimeConfig("VITE_ORDERLY_BROKER_ID")}
-      brokerName={getRuntimeConfig("VITE_ORDERLY_BROKER_NAME")}
-      networkId={networkId}
+      configStore={configStore}
+      themes={themes}
       onChainChanged={onChainChanged}
       appIcons={config.orderlyAppProvider.appIcons}
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -202,7 +174,7 @@ const OrderlyProvider = (props: { children: ReactNode }) => {
       dataAdapter={dataAdapter}
       restrictedInfo={{
         customRestrictedRegions: getRuntimeConfigArray(
-          "VITE_RESTRICTED_REGIONS"
+          "VITE_RESTRICTED_REGIONS",
         ),
       }}
     >
@@ -219,15 +191,9 @@ const OrderlyProvider = (props: { children: ReactNode }) => {
   );
 
   return (
-    <LocaleProvider
-      onLanguageChanged={onLanguageChanged}
-      backend={{ loadPath }}
-      resources={resources}
-      locale={defaultLanguage}
-      languages={filteredLanguages}
-    >
+    <OrderlyLocaleProvider>
       <Suspense fallback={<LoadingSpinner />}>{walletConnector}</Suspense>
-    </LocaleProvider>
+    </OrderlyLocaleProvider>
   );
 };
 
